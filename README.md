@@ -30,6 +30,14 @@ This firmware is developed and built using the following stack:
 
 ---
 
+## 🔌 Communication Protocol
+
+The module is controlled via a standard Serial UART line operating at **460800 baud (8N1)**. It features an ASCII-based protocol with a 2-step handshake mechanism for destructive operations (reboot, factory reset).
+
+For the complete command reference, response frames, and async event details, see the **[UART Protocol Documentation](docs/UART_PROTOCOL.md)**.
+
+---
+
 ## ⚖️ License & Terms of Use
 
 This project is licensed under the **GNU General Public License v3.0 (GPLv3)**.
