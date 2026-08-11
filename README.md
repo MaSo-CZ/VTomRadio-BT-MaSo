@@ -1,4 +1,4 @@
-# VTomRadio-BT-MaSo
+# VTomRadio-MaSo-BT
 
 Bluetooth module firmware/code for the eRadio VTomRadio project based on ESP32.
 
