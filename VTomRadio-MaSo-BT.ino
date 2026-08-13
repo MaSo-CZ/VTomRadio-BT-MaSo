@@ -26,7 +26,7 @@
 #define I2S_BCLK_PIN    GPIO_NUM_12   // Společný Bit Clock
 #define I2S_WS_PIN      GPIO_NUM_27   // Společný Word Select (LRCLK)
 #define I2S_DOUT_PIN    GPIO_NUM_14   // Data Out (Vysílání do DAC / BT RX mód)
-#define I2S_DIN_PIN     GPIO_NUM_13   // Data In (Příjem z ADC / BT TX mód)
+#define I2S_DIN_PIN     GPIO_NUM_26   // Data In (Příjem z ADC / BT TX mód)
 
 // Globální i2s handle
 static i2s_chan_handle_t tx_chan = NULL;
@@ -93,6 +93,44 @@ void initBluetoothStack();
 void audioProcessingTask(void *pvParameters);
 String generateDefaultName();
 
+#define USE_INMP441_MIC  1 // Set 0 pro vypnutí mikrofonu (např. při příjmu z jiného ESP)
+#define AMP_GAIN         3 // +18dB zesílení
+
+// Funkce pro načtení z I2S a úpravu pro BT / další zpracování
+int read_and_process_audio(int16_t *out_pcm16_buffer, size_t max_samples) {
+#if USE_INMP441_MIC
+    static int32_t raw_i2s_buffer[256];
+    size_t bytes_read = 0;
+
+    // Použijeme krátký timeout místo portMAX_DELAY
+    if (i2s_channel_read(rx_chan, raw_i2s_buffer, sizeof(raw_i2s_buffer), &bytes_read, pdMS_TO_TICKS(10)) == ESP_OK) {
+        int mono_samples = bytes_read / sizeof(int32_t);
+        int out_idx = 0;
+
+        for (int i = 0; i < mono_samples; i++) {
+            if (out_idx + 1 >= (int)max_samples) break;
+
+            // Správný převod 32-bit I2S -> 16-bit PCM
+            int32_t sample = raw_i2s_buffer[i] >> 16; 
+
+            // Aplikace zisku AMP_GAIN
+            sample = sample << AMP_GAIN;
+
+            // Saturace na 16-bit
+            if (sample > 32767)       sample = 32767;
+            else if (sample < -32768) sample = -32768;
+
+            int16_t sample_16 = (int16_t)sample;
+
+            // Duplikace do stereo (L + R) pro A2DP
+            out_pcm16_buffer[out_idx++] = sample_16; 
+            out_pcm16_buffer[out_idx++] = sample_16; 
+        }
+        return out_idx;
+    }
+    return 0;
+#endif
+}
 
 void initTempSensor() {
 }
@@ -165,14 +203,18 @@ bool i2s_init_rx(uint32_t sample_rate) {
     i2s_stop_and_deinit();
 
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    chan_cfg.dma_desc_num = 8;
+    chan_cfg.dma_desc_num = 6;
     chan_cfg.dma_frame_num = 256;
 
     if (i2s_new_channel(&chan_cfg, NULL, &rx_chan) != ESP_OK) return false;
 
+    // KONFIGURACE PRO INMP441 S PINEM L/R NA VDD
+    i2s_std_slot_config_t slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO);
+    slot_cfg.slot_mask = I2S_STD_SLOT_RIGHT; // L/R pin na VDD = RIGHT slot
+
     i2s_std_config_t std_cfg = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate),
-        .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+        .slot_cfg = slot_cfg,
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
             .bclk = I2S_BCLK_PIN,
@@ -186,7 +228,7 @@ bool i2s_init_rx(uint32_t sample_rate) {
     if (i2s_channel_init_std_mode(rx_chan, &std_cfg) != ESP_OK) return false;
     if (i2s_channel_enable(rx_chan) != ESP_OK) return false;
 
-    Serial.println("I2S: RX Inicializován (Master)");
+    Serial.println("I2S: RX Inicializován (INMP441 32-bit MONO RIGHT)");
     return true;
 }
 
@@ -282,6 +324,9 @@ void bt_a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param) {
 
             if (btMode == "RX") {
                 esp_avrc_ct_send_get_play_status_cmd(0);
+            } else if (btMode == "TX") {
+                // EXPLICITNÍ SPUŠTĚNÍ STREAMU PRO TX
+                esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
             }
 
         } else if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
@@ -291,45 +336,54 @@ void bt_a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param) {
             Serial.println("STATUS:DISCONNECTED");
         }
     }
+    // Přidejte obsluhu media state
+    else if (event == ESP_A2D_MEDIA_CTRL_ACK_EVT) {
+        if (param->media_ctrl_stat.cmd == ESP_A2D_MEDIA_CTRL_START &&
+            param->media_ctrl_stat.status == ESP_A2D_MEDIA_CTRL_ACK_SUCCESS) {
+            Serial.println("INFO: A2DP Media Stream Started");
+        }
+    }
 }
 
 int32_t bt_a2dp_data_cb(uint8_t *data, int32_t len) {
     if (data == NULL || len <= 0) return 0;
 
-    if (isMuted) {
+    if (isMuted || !isConnected) {
         clearAudioBuffer();
         memset(data, 0, len);
         return len;
     }
 
     size_t bytesRead = 0;
-    if (audioRingBuffer != NULL && !isMuted) {
-        void* item = xRingbufferReceiveUpTo(audioRingBuffer, &bytesRead, 0, len);
-        if (item != NULL) {
-            memcpy(data, item, bytesRead);
-            vRingbufferReturnItem(audioRingBuffer, item);
+    void* item = xRingbufferReceiveUpTo(audioRingBuffer, &bytesRead, 0, len);
 
-            if (gain != 1.00f) {
-                int16_t *samples = (int16_t *)data;
-                size_t sampleCount = bytesRead / 2;
-                for (size_t i = 0; i < sampleCount; i++) {
-                    int32_t sample = (int32_t)(samples[i] * gain);
-                    if (sample > 32767) sample = 32767;
-                    if (sample < -32768) sample = -32768;
-                    samples[i] = (int16_t)sample;
-                }
-            }
-        } else {
-            memset(data, 0, len);
-            bytesRead = len;
+    if (item != NULL && bytesRead > 0) {
+        memcpy(data, item, bytesRead);
+        vRingbufferReturnItem(audioRingBuffer, item);
+
+        // Pokud chybí jen pár bytů do plného rámce, dopočítáme zbytek nulami
+        if (bytesRead < (size_t)len) {
+            memset(data + bytesRead, 0, len - bytesRead);
         }
     } else {
+        // Vyprázdněný buffer - vrátíme ticho
         memset(data, 0, len);
-        bytesRead = len;
     }
-    return bytesRead;
-}
 
+    // Aplikace Gain (při 1.00f přeskočíme pro úsporu CPU)
+    if (gain != 1.00f) {
+        int16_t *samples = (int16_t *)data;
+        size_t sampleCount = len / 2;
+        for (size_t i = 0; i < sampleCount; i++) {
+            int32_t sample = (int32_t)(samples[i] * gain);
+            if (sample > 32767) sample = 32767;
+            if (sample < -32768) sample = -32768;
+            samples[i] = (int16_t)sample;
+        }
+    }
+
+    return len;
+}
 void bt_a2dp_sink_data_cb(const uint8_t *data, uint32_t len) {
     if (data == NULL || len == 0 || isMuted) return;
 
@@ -492,41 +546,39 @@ void initBluetoothStack() {
 // THREAD PRO AUDIO / 2. JÁDRO (CORE 1)
 // ==========================================
 void audioProcessingTask(void *pvParameters) {
-    audioRingBuffer = xRingbufferCreate(RING_BUFFER_SIZE, RINGBUF_TYPE_BYTEBUF);
+    // Pro TX stačí menší RingBuffer (např. 16–32 kB), 64 kB vytváří zbytečnou latenci
+    audioRingBuffer = xRingbufferCreate(32 * 1024, RINGBUF_TYPE_BYTEBUF);
 
     if (audioRingBuffer == NULL) {
         Serial.println("ERR:RINGBUFFER_FAILED");
     }
 
-    size_t bytesRead = 0;
-    size_t bytesWritten = 0;
-    
-    // OPRAVA: static zabrání alokaci 2 KB na stacku tasku!
-    static uint8_t i2sRxBuf[2048]; 
+    static int16_t pcm16Buf[512]; 
 
     for (;;) {
-        if (isMuted) {
+        if (isMuted || !isConnected) {
             clearAudioBuffer();
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
 
-        if (btMode == "RX" && tx_chan != NULL) {
-            void* item = xRingbufferReceiveUpTo(audioRingBuffer, &bytesRead, pdMS_TO_TICKS(10), 2048);
-            if (item != NULL) {
-                i2s_channel_write(tx_chan, item, bytesRead, &bytesWritten, portMAX_DELAY);
-                vRingbufferReturnItem(audioRingBuffer, item);
-            }
-        } 
-        else if (btMode == "TX" && rx_chan != NULL) {
-            if (i2s_channel_read(rx_chan, i2sRxBuf, sizeof(i2sRxBuf), &bytesRead, pdMS_TO_TICKS(10)) == ESP_OK) {
-                if (bytesRead > 0 && audioRingBuffer != NULL) {
-                    // OPRAVA: Timeout nastaven na 10 ms pro ochranu proti ztrátě dat
-                    xRingbufferSend(audioRingBuffer, i2sRxBuf, bytesRead, pdMS_TO_TICKS(10));
+        if (btMode == "TX" && rx_chan != NULL) {
+            int total_samples = read_and_process_audio(pcm16Buf, sizeof(pcm16Buf) / sizeof(int16_t));
+            
+            if (total_samples > 0 && audioRingBuffer != NULL) {
+                size_t bytesToSend = total_samples * sizeof(int16_t);
+                
+                // Pokus o odeslání s krátkým timeoutem
+                if (xRingbufferSend(audioRingBuffer, pcm16Buf, bytesToSend, pdMS_TO_TICKS(5)) != pdTRUE) {
+                    // Pokud je buffer plný, promažeme část starých dat (prevence zaseknutí)
+                    size_t dummySize = 0;
+                    void* dummy = xRingbufferReceiveUpTo(audioRingBuffer, &dummySize, 0, 2048);
+                    if (dummy) vRingbufferReturnItem(audioRingBuffer, dummy);
                 }
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(1));
             }
-        } 
-        else {
+        } else {
             vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
@@ -760,7 +812,7 @@ void setup() {
         "AudioTask",
         8192,
         NULL,
-        2,
+        5,
         &audioTaskHandle,
         1
     );
