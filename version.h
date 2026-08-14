@@ -4,27 +4,27 @@
 #include <Arduino.h>
 
 // =============================================================================
-// DEFINICE VERZE FIRMWARU, eg. 0.3, 0.3.6, 2.1b
+// FIRMWARE VERSION DEFINITIONS, e.g. 0.3, 0.3.6, 2.1b
 // =============================================================================
 #define FW_VERSION_MAJOR    0     // 0-2147
 #define FW_VERSION_MINOR    3     // 0-99
 #define FW_VERSION_PATCH    5     // 0-99
-#define FW_VERSION_SUFFIX   NONE  // NONE, a, b, ... (w/o suffix, alfa, beta, ...)
+#define FW_VERSION_SUFFIX   NONE  // NONE, a, b, ... (w/o suffix, alpha, beta, ...)
 
 // =============================================================================
-// DATUM A ČAS KOMPILACE
+// BUILD DATE AND TIME
 // =============================================================================
-#define FW_BUILD_DATE       __DATE__     // Tvar: "Aug 14 2026"
-#define FW_BUILD_TIME       __TIME__     // Tvar: "08:38:23"
+#define FW_BUILD_DATE       __DATE__     // Format: "Aug 14 2026"
+#define FW_BUILD_TIME       __TIME__     // Format: "08:38:23"
 #define FW_BUILD_DATETIME   __DATE__ " " __TIME__
 
 // =============================================================================
-// HELPERY PRO PREPROCESOR (Převod na znak a řetězec)
+// PREPROCESSOR HELPERS (convert to character and string)
 // =============================================================================
 #define STRINGIFY(x) #x
 #define TOSTRING(x) STRINGIFY(x)
 
-// Vnitřní mapování pro spojení znaků/řetězců
+// Internal mapping for character/string concatenation
 #define CHARIFY_NONE '\0'
 #define CHARIFY_a 'a'
 #define CHARIFY_b 'b'
@@ -41,19 +41,19 @@
 #define STR_dev "dev"
 #define STR_rc1 "rc1"
 
-// Dvouúrovňové rozbalení makra (vynutí přepis FW_VERSION_SUFFIX -> b)
+// Two-level macro expansion (forces expansion of FW_VERSION_SUFFIX -> b)
 #define CHARIFY_CONCAT(x) CHARIFY_##x
 #define CHARIFY(x) CHARIFY_CONCAT(x)
 
 #define STR_CONCAT(x) STR_##x
 #define STR(x) STR_CONCAT(x)
 
-// Automatické vygenerování znaku a řetězce
+// Automatic generation of suffix character and string
 #define FW_SUFFIX_CHAR  CHARIFY(FW_VERSION_SUFFIX)
 #define FW_SUFFIX_STR   STR(FW_VERSION_SUFFIX)
 
 // =============================================================================
-// SESTAVENÍ ŘETĚZCE VERZE (TEXT)
+// BUILD VERSION STRING (TEXT)
 // =============================================================================
 #if FW_VERSION_PATCH > 0 || (FW_SUFFIX_CHAR != '\0')
   #define FW_VERSION_STR TOSTRING(FW_VERSION_MAJOR) "." TOSTRING(FW_VERSION_MINOR) "." TOSTRING(FW_VERSION_PATCH) FW_SUFFIX_STR
@@ -64,7 +64,7 @@
 #endif
 
 // =============================================================================
-// CELOČÍSELNÝ KÓD VERZE (PRO PODMÍNKY V KÓDU)
+// NUMERIC VERSION CODE (FOR CONDITIONALS IN CODE)
 // =============================================================================
 #define FW_SUFFIX_VAL ( \
   (FW_SUFFIX_CHAR == '\0') ? 99 : \
