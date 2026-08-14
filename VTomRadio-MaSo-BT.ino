@@ -102,24 +102,24 @@ String generateDefaultName();
 #define AMP_GAIN         3 // +18dB zesílení
 
 // ==========================================
-// DIAGNOSTIKA A LOGOVÁNÍ VÝPADKŮ
+// DIAGNOSTIKA A LOGOVÁNÍ VÝPADKŮ (OPRAVA #6)
 // ==========================================
 
-// OPRAVA #6: Struktura pro sledování diagnostiky
 typedef struct {
-    unsigned long mutexTimeoutCount;      // Počet timeoutů mutexu
-    unsigned long ringbufferOverflowCount; // Počet přetečení ringbufferu
-    unsigned long i2sReadFailCount;       // Počet selhání čtení z I2S
-    unsigned long silenceFrameCount;      // Počet framů se "ticho" (prázdný buffer)
-    unsigned long lastMutexTimeoutTime;   // Timestamp posledního timeoutu
-    unsigned long lastOverflowTime;       // Timestamp posledního přetečení
-    unsigned long lastI2sFailTime;        // Timestamp posledního selhání I2S
-    uint32_t audioDataDroppedBytes;       // Počet bajtů, které se ztratily
+    unsigned long mutexTimeoutCount;
+    unsigned long ringbufferOverflowCount;
+    unsigned long i2sReadFailCount;
+    unsigned long silenceFrameCount;
+    unsigned long lastMutexTimeoutTime;
+    unsigned long lastOverflowTime;
+    unsigned long lastI2sFailTime;
+    uint32_t audioDataDroppedBytes;
+    uint32_t ringbufferMaxUsage;  // Sledování maximální zaplnění
+    uint32_t ringbufferCurrentUsage;
 } AudioDiagnostics;
 
 static AudioDiagnostics audioDiag = {0};
 
-// Funkce pro vypsání diagnostiky
 void printAudioDiagnostics() {
     Serial.printf("DIAG:MUTEX_TIMEOUTS=%lu,OVERFLOW_COUNT=%lu,I2S_FAILS=%lu,SILENCE_FRAMES=%lu,DROPPED_BYTES=%lu\n",
                   audioDiag.mutexTimeoutCount,
@@ -131,9 +131,11 @@ void printAudioDiagnostics() {
                   audioDiag.lastMutexTimeoutTime,
                   audioDiag.lastOverflowTime,
                   audioDiag.lastI2sFailTime);
+    Serial.printf("DIAG:RINGBUFFER_MAX_USAGE=%lu,CURRENT_USAGE=%lu\n",
+                  audioDiag.ringbufferMaxUsage,
+                  audioDiag.ringbufferCurrentUsage);
 }
 
-// Vynulovat diagnostiku
 void resetAudioDiagnostics() {
     memset(&audioDiag, 0, sizeof(AudioDiagnostics));
     Serial.println("INFO:DIAGNOSTICS_RESET");
@@ -428,7 +430,8 @@ int32_t bt_a2dp_data_cb(uint8_t *data, int32_t len) {
         return len;
     }
 
-    if (audioBufferMutex != NULL && xSemaphoreTake(audioBufferMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+    // OPRAVA #6a: Zvýšit timeout z 5ms na 20ms (BT callback je kritický)
+    if (audioBufferMutex != NULL && xSemaphoreTake(audioBufferMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
         size_t bytesRead = 0;
         void* item = xRingbufferReceiveUpTo(audioRingBuffer, &bytesRead, 0, len);
 
@@ -437,26 +440,25 @@ int32_t bt_a2dp_data_cb(uint8_t *data, int32_t len) {
             vRingbufferReturnItem(audioRingBuffer, item);
 
             if (bytesRead < (size_t)len) {
-                // ⚠️ NOVÉ: Logování nedostatečných dat
                 audioDiag.silenceFrameCount++;
                 audioDiag.audioDataDroppedBytes += (len - bytesRead);
                 memset(data + bytesRead, 0, len - bytesRead);
             }
         } else {
-            // ⚠️ NOVÉ: Prázdný buffer
             audioDiag.silenceFrameCount++;
             memset(data, 0, len);
         }
         xSemaphoreGive(audioBufferMutex);
     } else {
-        // ⚠️ NOVÉ: Mutex timeout
+        // Mutex timeout - logovat
         audioDiag.mutexTimeoutCount++;
         audioDiag.lastMutexTimeoutTime = millis();
         memset(data, 0, len);
         
         static unsigned long lastMutexReport = 0;
-        if (millis() - lastMutexReport > 5000) {
-            Serial.printf("WARN:MUTEX_TIMEOUT,COUNT=%lu\n", audioDiag.mutexTimeoutCount);
+        if (millis() - lastMutexReport > 10000) { // Log každých 10 sec
+            Serial.printf("WARN:MUTEX_TIMEOUT,COUNT=%lu,TIME=%lu\n", 
+                          audioDiag.mutexTimeoutCount, millis());
             lastMutexReport = millis();
         }
     }
@@ -665,16 +667,16 @@ void audioProcessingTask(void *pvParameters) {
     audioBufferMutex = xSemaphoreCreateMutex();
     if (audioBufferMutex == NULL) {
         Serial.println("ERR:MUTEX_CREATION_FAILED");
-        vTaskDelete(NULL);  // Skonči task ihned
+        vTaskDelete(NULL);
         return;
     }
 
     audioRingBuffer = xRingbufferCreate(32 * 1024, RINGBUF_TYPE_BYTEBUF);
     if (audioRingBuffer == NULL) {
         Serial.println("ERR:RINGBUFFER_FAILED");
-        vSemaphoreDelete(audioBufferMutex);  // Uvolni mutex
+        vSemaphoreDelete(audioBufferMutex);
         audioBufferMutex = NULL;
-        vTaskDelete(NULL);  // Skonči task
+        vTaskDelete(NULL);
         return;
     }
 
@@ -684,7 +686,6 @@ void audioProcessingTask(void *pvParameters) {
         if (btMode == "TX" && rx_chan != NULL) {
             int total_samples = read_and_process_audio(pcm16Buf, sizeof(pcm16Buf) / sizeof(int16_t));
             
-            // Pokud jsme zticha nebo odpojeni, buffer pouze vyčistíme a pokračujeme (vyprázdní se DMA)
             if (isMuted || !isConnected) {
                 clearAudioBuffer();
                 vTaskDelay(pdMS_TO_TICKS(5));
@@ -694,41 +695,46 @@ void audioProcessingTask(void *pvParameters) {
             if (total_samples > 0 && audioRingBuffer != NULL) {
                 size_t bytesToSend = total_samples * sizeof(int16_t);
                 
-                if (xSemaphoreTake(audioBufferMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-                    if (xRingbufferSend(audioRingBuffer, pcm16Buf, bytesToSend, pdMS_TO_TICKS(15)) != pdTRUE) {
-                        // ⚠️ NOVÉ: Logování přetečení
+                // OPRAVA #6b: Kratší kritická sekce - nesmí drží mutex déle než 5ms
+                if (xSemaphoreTake(audioBufferMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                    BaseType_t sendResult = xRingbufferSend(audioRingBuffer, pcm16Buf, bytesToSend, pdMS_TO_TICKS(5));
+                    
+                    // Hned uvolnit mutex
+                    xSemaphoreGive(audioBufferMutex);
+                    
+                    // Teprve pak řešit přetečení (mimo kritickou sekci)
+                    if (sendResult != pdTRUE) {
                         audioDiag.ringbufferOverflowCount++;
                         audioDiag.lastOverflowTime = millis();
                         audioDiag.audioDataDroppedBytes += bytesToSend;
-            
+                        
                         static unsigned long lastOverflowReport = 0;
-                        if (millis() - lastOverflowReport > 5000) {
-                            Serial.printf("WARN:RINGBUFFER_OVERFLOW,COUNT=%lu,DROPPED=%lu_bytes\n", 
-                                audioDiag.ringbufferOverflowCount, audioDiag.audioDataDroppedBytes);
+                        if (millis() - lastOverflowReport > 10000) {
+                            Serial.printf("WARN:RINGBUFFER_OVERFLOW,COUNT=%lu,DROPPED=%lu\n", 
+                                          audioDiag.ringbufferOverflowCount, 
+                                          audioDiag.audioDataDroppedBytes);
                             lastOverflowReport = millis();
                         }
-            
-                        // Pokus o uvolnění místa
-                        size_t dummySize = 0;
-                        void* dummy = xRingbufferReceiveUpTo(audioRingBuffer, &dummySize, 0, 2048);
-                        if (dummy) vRingbufferReturnItem(audioRingBuffer, dummy);
+                        
+                        // Cleanup mimo kritickou sekci
+                        vTaskDelay(pdMS_TO_TICKS(2));
+                        if (xSemaphoreTake(audioBufferMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                            size_t dummySize = 0;
+                            void* dummy = xRingbufferReceiveUpTo(audioRingBuffer, &dummySize, 0, 2048);
+                            if (dummy) vRingbufferReturnItem(audioRingBuffer, dummy);
+                            xSemaphoreGive(audioBufferMutex);
+                        }
                     }
-                    xSemaphoreGive(audioBufferMutex);
+                } else {
+                    vTaskDelay(pdMS_TO_TICKS(1));
                 }
             } else {
                 vTaskDelay(pdMS_TO_TICKS(1));
             }
         } else {
-            // V RX módu data přichází pasivně přes BT callback (bt_a2dp_sink_data_cb)
             vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
-    
-    // Cleanup (teoreticky nedosažitelný, ale pro budoucí rozšíření)
-    vSemaphoreDelete(audioBufferMutex);
-    vRingbufferDelete(audioRingBuffer);
-    audioBufferMutex = NULL;
-    audioRingBuffer = NULL;
 }
 
 // ==========================================
