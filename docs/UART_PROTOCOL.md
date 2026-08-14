@@ -47,7 +47,9 @@ For potentially destructive operations (`CMD:REBOOT` and `CMD:RESET-DEFAULT`), a
 | Command | Response / Event | Description |
 | :--- | :--- | :--- |
 | `GET:STATUS` | `STATUS:<CONNECTED\|DISCONNECTED>,MODE:<TX\|RX>` | Returns connection state and active Bluetooth mode. |
-| `GET:INFO` | `INFO:FW_v1.0,RAM_FREE:<bytes>,MODE:<mode>` | Returns firmware version, free Heap memory (bytes), and mode. |
+| `GET:INFO` | `INFO:RAM_FREE:<bytes>,MODE:<mode>` | Returns firmware version, free Heap memory (bytes) and mode. |
+| `GET:FWINFO` | `INFO:VTomRadio-MaSo-BT v0.3,Aug 14 2026 09:12:42,030099` | Returns firmware version, build time and FW numerical version for compare. |
+| `GET:FWCODE` | `INFO:030099` | Returns firmware numerical version. |
 | `GET:RSSI` | `RSSI:<dBm>`<br>`ERR:NOT_CONNECTED` | Requests Bluetooth signal strength (RSSI delta) from connected peer. |
 | `GET:TEMP` | `TEMP:<celsius>`<br>`ERR:TEMP_READ_FAILED` | Reads internal ESP32 chip core temperature in °C. |
 
