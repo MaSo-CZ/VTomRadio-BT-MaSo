@@ -6,7 +6,7 @@
 // =============================================================================
 // DEFINICE VERZE FIRMWARU, eg. 0.3, 0.3.6, 2.1b
 // =============================================================================
-#define FW_VERSION_MAJOR    0     
+#define FW_VERSION_MAJOR    0     // 0-2147
 #define FW_VERSION_MINOR    3     // 0-99
 #define FW_VERSION_PATCH    5     // 0-99
 #define FW_VERSION_SUFFIX   NONE  // NONE, a, b, ... (w/o suffix, alfa, beta, ...)
