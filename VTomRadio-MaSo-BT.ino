@@ -4,7 +4,7 @@
   #error "This code is intended exclusively for classic ESP32 (CONFIG_IDF_TARGET_ESP32)! Please check your target board selection in Arduino IDE."
 #endif
 
-#define FW_VERSION "VTomRadio-MaSo-BT v0.3"
+#include "version.h"
 
 #include <Preferences.h>
 #include <freertos/FreeRTOS.h>
@@ -797,8 +797,11 @@ void processUartCommand(String cmd) {
     else if (cmd == "GET:INFO") {
         Serial.printf("INFO:RAM_FREE:%u,MODE:%s\n", ESP.getFreeHeap(), btMode.c_str());
     }
-    else if (cmd == "GET:FW") {
-        Serial.printf("INFO:%s\n", FW_VERSION);
+    else if (cmd == "GET:FWINFO") {
+        Serial.printf("INFO:%s v%s,DATE:%s,CODE:%ld\n", FW_VERSION_NAME, FW_VERSION_STR, FW_BUILD_DATETIME, FW_VERSION_CODE);
+    }
+    else if (cmd == "GET:FWCODE") {
+        Serial.printf("INFO:%ld\n", FW_VERSION_CODE);
     }
     else if (cmd == "GET:RSSI") {
         if (isConnected) {
@@ -859,6 +862,12 @@ void processUartCommand(String cmd) {
 void setup() {
     delay(500);
     Serial.begin(UART_BAUD_RATE);
+    delay(500);
+
+    Serial.printf("\n\nFirmware: %s v%s\n", FW_VERSION_NAME, FW_VERSION_STR);
+    Serial.printf("Build:    %s\n", FW_BUILD_DATETIME);
+    Serial.printf("Code:     %ld\n\n", FW_VERSION_CODE);
+
     // Nastavení krátkého neblokujícího timeoutu pro čtení z UART
     Serial.setTimeout(50); 
     delay(500);
