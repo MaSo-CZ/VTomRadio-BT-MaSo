@@ -229,21 +229,18 @@ bool i2s_init_tx(uint32_t sample_rate) {
 bool i2s_init_rx(uint32_t sample_rate) {
     i2s_stop_and_deinit();
 
-//    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_SLAVE);
-    chan_cfg.dma_desc_num = 6;
-    chan_cfg.dma_frame_num = 256;
-
-    if (i2s_new_channel(&chan_cfg, NULL, &rx_chan) != ESP_OK) return false;
-
 #if USE_INMP441_MIC
     // KONFIGURACE PRO INMP441 S PINEM L/R NA VDD
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     i2s_std_slot_config_t slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO);
     slot_cfg.slot_mask = I2S_STD_SLOT_RIGHT; // L/R pin na VDD = RIGHT slot
 #else
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_SLAVE);
     i2s_std_slot_config_t slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO);
-//    slot_cfg.slot_mask = I2S_STD_SLOT_RIGHT; // L/R pin na VDD = RIGHT slot
 #endif
+    chan_cfg.dma_desc_num = 6;
+    chan_cfg.dma_frame_num = 256;
+    if (i2s_new_channel(&chan_cfg, NULL, &rx_chan) != ESP_OK) return false;
 
     i2s_std_config_t std_cfg = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate),
@@ -619,39 +616,31 @@ void initBluetoothStack() {
 // THREAD PRO AUDIO / 2. JÁDRO (CORE 1)
 // ==========================================
 void audioProcessingTask(void *pvParameters) {
-    // Pro TX stačí menší RingBuffer (např. 16–32 kB), 64 kB vytváří zbytečnou latenci
-    // OPRAVA #2: Vytvoření mutex pro ochranu audioRingBuffer
     audioBufferMutex = xSemaphoreCreateMutex();
-    
     audioRingBuffer = xRingbufferCreate(32 * 1024, RINGBUF_TYPE_BYTEBUF);
 
-    if (audioRingBuffer == NULL) {
-        Serial.println("ERR:RINGBUFFER_FAILED");
-    }
-    if (audioBufferMutex == NULL) {
-        Serial.println("ERR:MUTEX_CREATION_FAILED");
-    }
+    if (audioRingBuffer == NULL) Serial.println("ERR:RINGBUFFER_FAILED");
+    if (audioBufferMutex == NULL) Serial.println("ERR:MUTEX_CREATION_FAILED");
 
     static int16_t pcm16Buf[512]; 
 
     for (;;) {
-        if (isMuted || !isConnected) {
-            clearAudioBuffer();
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
-        }
-
         if (btMode == "TX" && rx_chan != NULL) {
             int total_samples = read_and_process_audio(pcm16Buf, sizeof(pcm16Buf) / sizeof(int16_t));
             
+            // Pokud jsme zticha nebo odpojeni, buffer pouze vyčistíme a pokračujeme (vyprázdní se DMA)
+            if (isMuted || !isConnected) {
+                clearAudioBuffer();
+                vTaskDelay(pdMS_TO_TICKS(5));
+                continue;
+            }
+
             if (total_samples > 0 && audioRingBuffer != NULL) {
                 size_t bytesToSend = total_samples * sizeof(int16_t);
                 
-                // OPRAVA #8: Zvýšen timeout z 5ms na 15ms pro lepší stabilitu
-                // 15ms timeout umožňuje bufferu pojmout více vzorků a snižuje ztrátu dat
                 if (xSemaphoreTake(audioBufferMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
                     if (xRingbufferSend(audioRingBuffer, pcm16Buf, bytesToSend, pdMS_TO_TICKS(15)) != pdTRUE) {
-                        // Pokud je buffer plný, promažeme část starých dat (prevence zaseknutí)
+                        // Při přetečení uvolníme staré bloky
                         size_t dummySize = 0;
                         void* dummy = xRingbufferReceiveUpTo(audioRingBuffer, &dummySize, 0, 2048);
                         if (dummy) vRingbufferReturnItem(audioRingBuffer, dummy);
@@ -662,6 +651,7 @@ void audioProcessingTask(void *pvParameters) {
                 vTaskDelay(pdMS_TO_TICKS(1));
             }
         } else {
+            // V RX módu data přichází pasivně přes BT callback (bt_a2dp_sink_data_cb)
             vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
@@ -715,6 +705,14 @@ void processUartCommand(String cmd) {
             prefs.begin("bt_config", false);
             prefs.putUChar("volume", volume);
             prefs.end();
+
+            // Pokud jsme v RX módu a připojeni, odešleme hlasitost do vysílajícího zařízení
+            if (btMode == "RX" && isConnected) {
+                esp_avrc_rn_param_t rn_param;
+                rn_param.volume = volume;
+                esp_avrc_tg_send_rn_rsp(ESP_AVRC_RN_VOLUME_CHANGE, ESP_AVRC_RN_RSP_CHANGED, &rn_param);
+            }
+
             Serial.println("OK:VOL=" + String(volume));
         } else {
             Serial.println("ERR:INVALID_VOL");
@@ -929,13 +927,22 @@ void setup() {
 }
 
 void loop() {
-    if (Serial.available() > 0) {
-        String inputStr = Serial.readStringUntil('\n');
-        processUartCommand(inputStr);
+    static String inputBuffer = "";
+
+    while (Serial.available() > 0) {
+        char c = (char)Serial.read();
+        if (c == '\n') {
+            processUartCommand(inputBuffer);
+            inputBuffer = "";
+        } else if (c != '\r') { // Ignorujeme CR (Carriage Return)
+            inputBuffer += c;
+            // Ochrana proti přetečení nevalidním řetězcem
+            if (inputBuffer.length() > 128) {
+                inputBuffer = "";
+            }
+        }
     }
 
     checkHandshakeTimeout();
-    
-    // OPRAVA #4: Přidán delay pro snížení vytížení Core 0
-    vTaskDelay(pdMS_TO_TICKS(10));
+    vTaskDelay(pdMS_TO_TICKS(5)); // Krátký odpočinek pro IDLE task na Core 0
 }
