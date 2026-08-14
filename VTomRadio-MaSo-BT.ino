@@ -697,7 +697,10 @@ void audioProcessingTask(void *pvParameters) {
     }
 
     static int16_t pcm16Buf[512];
-    static unsigned long lastCleanupTime = 0;
+    
+    // OPRAVA #6d: Lokální buffer pro sběr dat do 2048 bytů (A2DP frame)
+    static uint8_t localBuffer[2048];
+    static size_t localBufferUsed = 0;
 
     for (;;) {
         if (btMode == "TX" && rx_chan != NULL) {
@@ -705,61 +708,50 @@ void audioProcessingTask(void *pvParameters) {
             
             if (isMuted || !isConnected) {
                 clearAudioBuffer();
+                localBufferUsed = 0;  // Reset lokálního bufferu
                 vTaskDelay(pdMS_TO_TICKS(5));
                 continue;
             }
 
             if (total_samples > 0 && audioRingBuffer != NULL) {
-                size_t bytesToSend = total_samples * sizeof(int16_t);
+                size_t bytesToAdd = total_samples * sizeof(int16_t);
                 
-                // OPRAVA #6c: Inteligentní sending s backpressure
-                if (xSemaphoreTake(audioBufferMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                    BaseType_t sendResult = xRingbufferSend(audioRingBuffer, pcm16Buf, bytesToSend, pdMS_TO_TICKS(2));
-                    
-                    xSemaphoreGive(audioBufferMutex);
-                    
-                    if (sendResult != pdTRUE) {
-                        audioDiag.ringbufferOverflowCount++;
-                        audioDiag.lastOverflowTime = millis();
-                        audioDiag.audioDataDroppedBytes += bytesToSend;
-                        
-                        // Agresivnější cleanup - smazat starší data
-                        if (xSemaphoreTake(audioBufferMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                            size_t freedBytes = 0;
-                            
-                            // Smazat až 8 kB starých dat
-                            for (int attempt = 0; attempt < 8; attempt++) {
-                                size_t dummySize = 0;
-                                void* dummy = xRingbufferReceiveUpTo(audioRingBuffer, &dummySize, 0, 1024);
-                                if (dummy) {
-                                    vRingbufferReturnItem(audioRingBuffer, dummy);
-                                    freedBytes += dummySize;
-                                } else {
-                                    break;
-                                }
-                            }
-                            xSemaphoreGive(audioBufferMutex);
+                // Kopírovat do lokálního bufferu
+                if (localBufferUsed + bytesToAdd <= sizeof(localBuffer)) {
+                    memcpy(localBuffer + localBufferUsed, pcm16Buf, bytesToAdd);
+                    localBufferUsed += bytesToAdd;
+                } else {
+                    // Lokální buffer je plný - poslat jej do ringbufferu
+                    if (xSemaphoreTake(audioBufferMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                        if (xRingbufferSend(audioRingBuffer, localBuffer, localBufferUsed, pdMS_TO_TICKS(2)) != pdTRUE) {
+                            audioDiag.ringbufferOverflowCount++;
+                            audioDiag.lastOverflowTime = millis();
+                            audioDiag.audioDataDroppedBytes += localBufferUsed;
                             
                             static unsigned long lastOverflowReport = 0;
                             if (millis() - lastOverflowReport > 10000) {
-                                Serial.printf("WARN:RINGBUFFER_OVERFLOW,COUNT=%lu,DROPPED=%lu,FREED=%lu\n", 
+                                Serial.printf("WARN:RINGBUFFER_OVERFLOW,COUNT=%lu,DROPPED=%lu\n", 
                                               audioDiag.ringbufferOverflowCount, 
-                                              audioDiag.audioDataDroppedBytes,
-                                              freedBytes);
+                                              audioDiag.audioDataDroppedBytes);
                                 lastOverflowReport = millis();
                             }
                         }
-                        
-                        // Backpressure: počkat aby se buffer vyprázdnil
-                        vTaskDelay(pdMS_TO_TICKS(5));
+                        xSemaphoreGive(audioBufferMutex);
                     }
-                } else {
-                    vTaskDelay(pdMS_TO_TICKS(2));
+                    
+                    // Vynulovat lokální buffer a zkopírovat nová data
+                    localBufferUsed = 0;
+                    if (bytesToAdd <= sizeof(localBuffer)) {
+                        memcpy(localBuffer, pcm16Buf, bytesToAdd);
+                        localBufferUsed = bytesToAdd;
+                    }
                 }
             } else {
                 vTaskDelay(pdMS_TO_TICKS(1));
             }
         } else {
+            // V RX módu - vyprázdnit lokální buffer
+            localBufferUsed = 0;
             vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
