@@ -101,41 +101,77 @@ String generateDefaultName();
 #define USE_INMP441_MIC  0 // Set 0 pro vypnutí mikrofonu (např. při příjmu z jiného ESP)
 #define AMP_GAIN         3 // +18dB zesílení
 
+// ==========================================
+// DIAGNOSTIKA A LOGOVÁNÍ VÝPADKŮ
+// ==========================================
+
+// OPRAVA #6: Struktura pro sledování diagnostiky
+typedef struct {
+    unsigned long mutexTimeoutCount;      // Počet timeoutů mutexu
+    unsigned long ringbufferOverflowCount; // Počet přetečení ringbufferu
+    unsigned long i2sReadFailCount;       // Počet selhání čtení z I2S
+    unsigned long silenceFrameCount;      // Počet framů se "ticho" (prázdný buffer)
+    unsigned long lastMutexTimeoutTime;   // Timestamp posledního timeoutu
+    unsigned long lastOverflowTime;       // Timestamp posledního přetečení
+    unsigned long lastI2sFailTime;        // Timestamp posledního selhání I2S
+    uint32_t audioDataDroppedBytes;       // Počet bajtů, které se ztratily
+} AudioDiagnostics;
+
+static AudioDiagnostics audioDiag = {0};
+
+// Funkce pro vypsání diagnostiky
+void printAudioDiagnostics() {
+    Serial.printf("DIAG:MUTEX_TIMEOUTS=%lu,OVERFLOW_COUNT=%lu,I2S_FAILS=%lu,SILENCE_FRAMES=%lu,DROPPED_BYTES=%lu\n",
+                  audioDiag.mutexTimeoutCount,
+                  audioDiag.ringbufferOverflowCount,
+                  audioDiag.i2sReadFailCount,
+                  audioDiag.silenceFrameCount,
+                  audioDiag.audioDataDroppedBytes);
+    Serial.printf("DIAG:LAST_MUTEX_TIMEOUT=%lu,LAST_OVERFLOW=%lu,LAST_I2S_FAIL=%lu\n",
+                  audioDiag.lastMutexTimeoutTime,
+                  audioDiag.lastOverflowTime,
+                  audioDiag.lastI2sFailTime);
+}
+
+// Vynulovat diagnostiku
+void resetAudioDiagnostics() {
+    memset(&audioDiag, 0, sizeof(AudioDiagnostics));
+    Serial.println("INFO:DIAGNOSTICS_RESET");
+}
+
 // Funkce pro načtení z I2S a úpravu pro BT / další zpracování
 int read_and_process_audio(int16_t *out_pcm16_buffer, size_t max_samples) {
 #if USE_INMP441_MIC
     static int32_t raw_i2s_buffer[256];
     size_t bytes_read = 0;
 
-    // Použijeme krátký timeout místo portMAX_DELAY
     if (i2s_channel_read(rx_chan, raw_i2s_buffer, sizeof(raw_i2s_buffer), &bytes_read, pdMS_TO_TICKS(10)) == ESP_OK) {
         int mono_samples = bytes_read / sizeof(int32_t);
         int out_idx = 0;
 
         for (int i = 0; i < mono_samples; i++) {
             if (out_idx + 1 >= (int)max_samples) break;
-
-            // Správný převod 32-bit I2S -> 16-bit PCM
             int32_t sample = raw_i2s_buffer[i] >> 16; 
-
-            // Aplikace zisku AMP_GAIN
             sample = sample << AMP_GAIN;
-
-            // Saturace na 16-bit
             if (sample > 32767)       sample = 32767;
             else if (sample < -32768) sample = -32768;
-
             int16_t sample_16 = (int16_t)sample;
-
-            // Duplikace do stereo (L + R) pro A2DP
             out_pcm16_buffer[out_idx++] = sample_16; 
             out_pcm16_buffer[out_idx++] = sample_16; 
         }
         return out_idx;
+    } else {
+        // ⚠️ NOVÉ: Logování selhání
+        audioDiag.i2sReadFailCount++;
+        audioDiag.lastI2sFailTime = millis();
+        static unsigned long lastErrorReport = 0;
+        if (millis() - lastErrorReport > 5000) { // Log pouze každých 5 sec
+            Serial.printf("WARN:I2S_READ_TIMEOUT,COUNT=%lu\n", audioDiag.i2sReadFailCount);
+            lastErrorReport = millis();
+        }
     }
     return 0;
 #else
-    // PŘÍJEM Z MASTER ESP32 (32-bit STEREO Philips stream z Rádia)
     static int32_t raw_i2s_32bit_buffer[512]; 
     size_t bytes_read = 0;
     
@@ -144,16 +180,15 @@ int read_and_process_audio(int16_t *out_pcm16_buffer, size_t max_samples) {
 
     if (i2s_channel_read(rx_chan, raw_i2s_32bit_buffer, samples_to_read * sizeof(int32_t), &bytes_read, pdMS_TO_TICKS(10)) == ESP_OK) {
         int samples_count = bytes_read / sizeof(int32_t);
-
         for (int i = 0; i < samples_count; i++) {
-            // Správný posun z 32-bit slotu na 16-bit sample (Philips I2S má MSB nahoře)
             int32_t val = raw_i2s_32bit_buffer[i] >> 14; 
-            
-            // Pokud by to bylo velmi tiché, zkuste posun upravit např. na >> 8 nebo >> 12 podle toho, 
-            // jak rádio zarovnává 16bit vzorek do 32bit DMA bufferu
             out_pcm16_buffer[i] = (int16_t)val; 
         }
         return samples_count; 
+    } else {
+        // ⚠️ NOVÉ: Logování selhání
+        audioDiag.i2sReadFailCount++;
+        audioDiag.lastI2sFailTime = millis();
     }
     return 0;
 #endif
@@ -174,7 +209,8 @@ float getChipTemperature() {
 void clearAudioBuffer() {
     if (audioRingBuffer != NULL) {
         size_t dummySize = 0;
-        while (void* item = xRingbufferReceiveUpTo(audioRingBuffer, &dummySize, 0, 2048)) {
+        void* item = NULL;
+        while ((item = xRingbufferReceiveUpTo(audioRingBuffer, &dummySize, 0, 2048)) != NULL) {
             vRingbufferReturnItem(audioRingBuffer, item);
         }
     }
@@ -392,7 +428,6 @@ int32_t bt_a2dp_data_cb(uint8_t *data, int32_t len) {
         return len;
     }
 
-    // Ochrana přístupu k audioRingBuffer
     if (audioBufferMutex != NULL && xSemaphoreTake(audioBufferMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
         size_t bytesRead = 0;
         void* item = xRingbufferReceiveUpTo(audioRingBuffer, &bytesRead, 0, len);
@@ -401,21 +436,31 @@ int32_t bt_a2dp_data_cb(uint8_t *data, int32_t len) {
             memcpy(data, item, bytesRead);
             vRingbufferReturnItem(audioRingBuffer, item);
 
-            // Pokud chybí jen pár bytů do plného rámce, dopočítáme zbytek nulami
             if (bytesRead < (size_t)len) {
+                // ⚠️ NOVÉ: Logování nedostatečných dat
+                audioDiag.silenceFrameCount++;
+                audioDiag.audioDataDroppedBytes += (len - bytesRead);
                 memset(data + bytesRead, 0, len - bytesRead);
             }
         } else {
-            // Vyprázdněný buffer - vrátíme ticho
+            // ⚠️ NOVÉ: Prázdný buffer
+            audioDiag.silenceFrameCount++;
             memset(data, 0, len);
         }
         xSemaphoreGive(audioBufferMutex);
     } else {
-        // Nemůžeme získat mutex - vrátíme ticho
+        // ⚠️ NOVÉ: Mutex timeout
+        audioDiag.mutexTimeoutCount++;
+        audioDiag.lastMutexTimeoutTime = millis();
         memset(data, 0, len);
+        
+        static unsigned long lastMutexReport = 0;
+        if (millis() - lastMutexReport > 5000) {
+            Serial.printf("WARN:MUTEX_TIMEOUT,COUNT=%lu\n", audioDiag.mutexTimeoutCount);
+            lastMutexReport = millis();
+        }
     }
 
-    // Aplikace Gain (při 1.00f přeskočíme pro úsporu CPU)
     if (gain != 1.00f) {
         int16_t *samples = (int16_t *)data;
         size_t sampleCount = len / 2;
@@ -612,15 +657,26 @@ void initBluetoothStack() {
     }
 }
 
+// OPRAVA #3: Přidání cleanup a lepší inicializace mutex/ringbuffer
 // ==========================================
 // THREAD PRO AUDIO / 2. JÁDRO (CORE 1)
 // ==========================================
 void audioProcessingTask(void *pvParameters) {
     audioBufferMutex = xSemaphoreCreateMutex();
-    audioRingBuffer = xRingbufferCreate(32 * 1024, RINGBUF_TYPE_BYTEBUF);
+    if (audioBufferMutex == NULL) {
+        Serial.println("ERR:MUTEX_CREATION_FAILED");
+        vTaskDelete(NULL);  // Skonči task ihned
+        return;
+    }
 
-    if (audioRingBuffer == NULL) Serial.println("ERR:RINGBUFFER_FAILED");
-    if (audioBufferMutex == NULL) Serial.println("ERR:MUTEX_CREATION_FAILED");
+    audioRingBuffer = xRingbufferCreate(32 * 1024, RINGBUF_TYPE_BYTEBUF);
+    if (audioRingBuffer == NULL) {
+        Serial.println("ERR:RINGBUFFER_FAILED");
+        vSemaphoreDelete(audioBufferMutex);  // Uvolni mutex
+        audioBufferMutex = NULL;
+        vTaskDelete(NULL);  // Skonči task
+        return;
+    }
 
     static int16_t pcm16Buf[512]; 
 
@@ -640,7 +696,19 @@ void audioProcessingTask(void *pvParameters) {
                 
                 if (xSemaphoreTake(audioBufferMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
                     if (xRingbufferSend(audioRingBuffer, pcm16Buf, bytesToSend, pdMS_TO_TICKS(15)) != pdTRUE) {
-                        // Při přetečení uvolníme staré bloky
+                        // ⚠️ NOVÉ: Logování přetečení
+                        audioDiag.ringbufferOverflowCount++;
+                        audioDiag.lastOverflowTime = millis();
+                        audioDiag.audioDataDroppedBytes += bytesToSend;
+            
+                        static unsigned long lastOverflowReport = 0;
+                        if (millis() - lastOverflowReport > 5000) {
+                            Serial.printf("WARN:RINGBUFFER_OVERFLOW,COUNT=%lu,DROPPED=%lu_bytes\n", 
+                                audioDiag.ringbufferOverflowCount, audioDiag.audioDataDroppedBytes);
+                            lastOverflowReport = millis();
+                        }
+            
+                        // Pokus o uvolnění místa
                         size_t dummySize = 0;
                         void* dummy = xRingbufferReceiveUpTo(audioRingBuffer, &dummySize, 0, 2048);
                         if (dummy) vRingbufferReturnItem(audioRingBuffer, dummy);
@@ -655,6 +723,12 @@ void audioProcessingTask(void *pvParameters) {
             vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
+    
+    // Cleanup (teoreticky nedosažitelný, ale pro budoucí rozšíření)
+    vSemaphoreDelete(audioBufferMutex);
+    vRingbufferDelete(audioRingBuffer);
+    audioBufferMutex = NULL;
+    audioRingBuffer = NULL;
 }
 
 // ==========================================
@@ -832,6 +906,12 @@ void processUartCommand(String cmd) {
     else if (cmd == "GET:FWCODE") {
         Serial.printf("INFO:%ld\n", FW_VERSION_CODE);
     }
+    else if (cmd == "GET:DIAG") {
+        printAudioDiagnostics(); 
+    }
+    else if (cmd == "CMD:RESET-DIAG") {
+        resetAudioDiagnostics();
+    }
     else if (cmd == "GET:RSSI") {
         if (isConnected) {
             esp_bt_gap_read_rssi_delta(connected_bda);
@@ -939,6 +1019,7 @@ void loop() {
             // Ochrana proti přetečení nevalidním řetězcem
             if (inputBuffer.length() > 128) {
                 inputBuffer = "";
+                Serial.println("ERR:INPUT_BUFFER_OVERFLOW");
             }
         }
     }
