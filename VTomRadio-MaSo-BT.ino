@@ -937,5 +937,5 @@ void loop() {
     checkHandshakeTimeout();
     
     // OPRAVA #4: Přidán delay pro snížení vytížení Core 0
-    delay(10);
+    vTaskDelay(pdMS_TO_TICKS(10));
 }
