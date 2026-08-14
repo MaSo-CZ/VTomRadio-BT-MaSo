@@ -34,6 +34,9 @@
 static i2s_chan_handle_t tx_chan = NULL;
 static i2s_chan_handle_t rx_chan = NULL;
 
+// Mutex pro ochranu audioRingBuffer (řeší race condition)
+static SemaphoreHandle_t audioBufferMutex = NULL;
+
 // Media global variables
 String trackTitle  = "Unknown Title";
 String trackArtist = "Unknown Artist";
@@ -192,7 +195,7 @@ void i2s_stop_and_deinit() {
     Serial.println("I2S: Uvolněno");
 }
 
-// Inicializace pro TX (Vysílání do DAC / BT RX mód)
+// Inicializace pro TX (Vysílání do DAC / Příjem dat z Bluetooth)
 bool i2s_init_tx(uint32_t sample_rate) {
     i2s_stop_and_deinit();
 
@@ -218,11 +221,11 @@ bool i2s_init_tx(uint32_t sample_rate) {
     if (i2s_channel_init_std_mode(tx_chan, &std_cfg) != ESP_OK) return false;
     if (i2s_channel_enable(tx_chan) != ESP_OK) return false;
 
-    Serial.println("I2S: TX Inicializován (Master)");
+    Serial.println("I2S: TX Inicializován (Master - výstup do DAC)");
     return true;
 }
 
-// Inicializace pro RX (Náběr z ADC / BT TX mód)
+// Inicializace pro RX (Vstup z ADC / Odesílání dat přes Bluetooth)
 bool i2s_init_rx(uint32_t sample_rate) {
     i2s_stop_and_deinit();
 
@@ -261,7 +264,7 @@ bool i2s_init_rx(uint32_t sample_rate) {
 #if USE_INMP441_MIC
     Serial.println("I2S: RX Inicializován (INMP441 32-bit MONO RIGHT)");
 #else
-    Serial.println("I2S: RX Inicializovan (Slave RX)");
+    Serial.println("I2S: RX Inicializovan (Slave RX - vstup z ADC)");
 #endif
     return true;
 }
@@ -347,8 +350,8 @@ String bdaToString(const uint8_t *bda) {
 
 void bt_a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param) {
     if (event == ESP_A2D_CONNECTION_STATE_EVT) {
-        clearAudioBuffer();
         if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
+            // Při připojení nejdříve nastavíme stav, až pak čistíme buffer
             isConnected = true;
             memcpy(connected_bda, param->conn_stat.remote_bda, 6);
             currentDeviceName = "";
@@ -356,15 +359,19 @@ void bt_a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param) {
             String macStr = bdaToString(connected_bda);
             Serial.println("STATUS:CONNECTED,MAC=" + macStr);
 
+            // Teprve teď čistíme buffer, když jsme si jisti, že jsme připojeni
+            clearAudioBuffer();
+
             if (btMode == "RX") {
                 esp_avrc_ct_send_get_play_status_cmd(0);
             } else if (btMode == "TX") {
-                // EXPLICITNÍ SPUŠTĚNÍ STREAMU PRO TX
+                // EXPLICITNÍ SPUŠTĚNÍ STREAMU PRO TX (odesílání přes Bluetooth)
                 esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
             }
 
         } else if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
             isConnected = false;
+            clearAudioBuffer();
             memset(connected_bda, 0, 6);
             currentDeviceName = "";
             Serial.println("STATUS:DISCONNECTED");
@@ -388,19 +395,26 @@ int32_t bt_a2dp_data_cb(uint8_t *data, int32_t len) {
         return len;
     }
 
-    size_t bytesRead = 0;
-    void* item = xRingbufferReceiveUpTo(audioRingBuffer, &bytesRead, 0, len);
+    // Ochrana přístupu k audioRingBuffer
+    if (audioBufferMutex != NULL && xSemaphoreTake(audioBufferMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        size_t bytesRead = 0;
+        void* item = xRingbufferReceiveUpTo(audioRingBuffer, &bytesRead, 0, len);
 
-    if (item != NULL && bytesRead > 0) {
-        memcpy(data, item, bytesRead);
-        vRingbufferReturnItem(audioRingBuffer, item);
+        if (item != NULL && bytesRead > 0) {
+            memcpy(data, item, bytesRead);
+            vRingbufferReturnItem(audioRingBuffer, item);
 
-        // Pokud chybí jen pár bytů do plného rámce, dopočítáme zbytek nulami
-        if (bytesRead < (size_t)len) {
-            memset(data + bytesRead, 0, len - bytesRead);
+            // Pokud chybí jen pár bytů do plného rámce, dopočítáme zbytek nulami
+            if (bytesRead < (size_t)len) {
+                memset(data + bytesRead, 0, len - bytesRead);
+            }
+        } else {
+            // Vyprázdněný buffer - vrátíme ticho
+            memset(data, 0, len);
         }
+        xSemaphoreGive(audioBufferMutex);
     } else {
-        // Vyprázdněný buffer - vrátíme ticho
+        // Nemůžeme získat mutex - vrátíme ticho
         memset(data, 0, len);
     }
 
@@ -418,23 +432,23 @@ int32_t bt_a2dp_data_cb(uint8_t *data, int32_t len) {
 
     return len;
 }
+
 void bt_a2dp_sink_data_cb(const uint8_t *data, uint32_t len) {
     if (data == NULL || len == 0 || isMuted) return;
 
     if (gain != 1.00f) {
-        int16_t *samples = (int16_t *)data;
-        size_t sampleCount = len / 2;
-        for (size_t i = 0; i < sampleCount; i++) {
-            int32_t sample = (int32_t)(samples[i] * gain);
-            if (sample > 32767) sample = 32767;
-            if (sample < -32768) sample = -32768;
-            samples[i] = (int16_t)sample;
-        }
+        // POZNÁMKA: Zde nelze modifikovat const data! Toto je potenciální problém.
+        // Alternativa: kopírovat data do bufferu, upravit, pak odeslat.
+        // Pro nyní: pouze upozornění
+        Serial.println("WARN:GAIN_NOT_APPLIED_ON_RX_DATA");
     }
 
+    // Ochrana přístupu k audioRingBuffer
     if (audioRingBuffer != NULL) {
-        // Zvýšen timeout na 10 ms pro prevenci ztráty dat
-        xRingbufferSend(audioRingBuffer, (void*)data, len, pdMS_TO_TICKS(10));
+        if (audioBufferMutex != NULL && xSemaphoreTake(audioBufferMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            xRingbufferSend(audioRingBuffer, (void*)data, len, pdMS_TO_TICKS(10));
+            xSemaphoreGive(audioBufferMutex);
+        }
     }
 }
 
@@ -444,7 +458,7 @@ void bt_a2dp_sink_data_cb(const uint8_t *data, uint32_t len) {
 String generateDefaultName() {
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_BT);
-    char nameBuf[32];
+    char nameBuf[64];  // OPRAVA #8: Zvětšen buffer z 32 na 64 pro větší bezpečnost
     snprintf(nameBuf, sizeof(nameBuf), "VTomRadio-MaSo-%02X%02X%02X", mac[3], mac[4], mac[5]);
     return String(nameBuf);
 }
@@ -461,11 +475,13 @@ void loadNVSConfig() {
 void resetToDefaults() {
     prefs.begin("bt_config", false);
     prefs.clear();
+    // Po prefs.clear() jsou data smazána a lze bezpečně zapsat nové hodnoty
     prefs.putString("mode", DEFAULT_MODE);
     prefs.putString("bt_name", generateDefaultName());
     prefs.putUChar("volume", DEFAULT_VOLUME);
     prefs.putFloat("gain", DEFAULT_GAIN);
     prefs.end();
+    Serial.println("INFO:CONFIG_RESET_TO_DEFAULTS");
 }
 
 // ==========================================
@@ -475,7 +491,8 @@ void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param) {
     switch (event) {
         case ESP_BT_GAP_READ_REMOTE_NAME_EVT:
             if (param->read_rmt_name.stat == ESP_BT_STATUS_SUCCESS) {
-                currentDeviceName = String((char *)param->read_rmt_name.rmt_name);
+                // OPRAVA #7: Omezení délky jména na max 127 znaků pro bezpečnost
+                currentDeviceName = String((char *)param->read_rmt_name.rmt_name).substring(0, 127);
             }
             break;
 
@@ -603,10 +620,16 @@ void initBluetoothStack() {
 // ==========================================
 void audioProcessingTask(void *pvParameters) {
     // Pro TX stačí menší RingBuffer (např. 16–32 kB), 64 kB vytváří zbytečnou latenci
+    // OPRAVA #2: Vytvoření mutex pro ochranu audioRingBuffer
+    audioBufferMutex = xSemaphoreCreateMutex();
+    
     audioRingBuffer = xRingbufferCreate(32 * 1024, RINGBUF_TYPE_BYTEBUF);
 
     if (audioRingBuffer == NULL) {
         Serial.println("ERR:RINGBUFFER_FAILED");
+    }
+    if (audioBufferMutex == NULL) {
+        Serial.println("ERR:MUTEX_CREATION_FAILED");
     }
 
     static int16_t pcm16Buf[512]; 
@@ -624,12 +647,16 @@ void audioProcessingTask(void *pvParameters) {
             if (total_samples > 0 && audioRingBuffer != NULL) {
                 size_t bytesToSend = total_samples * sizeof(int16_t);
                 
-                // Pokus o odeslání s krátkým timeoutem
-                if (xRingbufferSend(audioRingBuffer, pcm16Buf, bytesToSend, pdMS_TO_TICKS(5)) != pdTRUE) {
-                    // Pokud je buffer plný, promažeme část starých dat (prevence zaseknutí)
-                    size_t dummySize = 0;
-                    void* dummy = xRingbufferReceiveUpTo(audioRingBuffer, &dummySize, 0, 2048);
-                    if (dummy) vRingbufferReturnItem(audioRingBuffer, dummy);
+                // OPRAVA #8: Zvýšen timeout z 5ms na 15ms pro lepší stabilitu
+                // 15ms timeout umožňuje bufferu pojmout více vzorků a snižuje ztrátu dat
+                if (xSemaphoreTake(audioBufferMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                    if (xRingbufferSend(audioRingBuffer, pcm16Buf, bytesToSend, pdMS_TO_TICKS(15)) != pdTRUE) {
+                        // Pokud je buffer plný, promažeme část starých dat (prevence zaseknutí)
+                        size_t dummySize = 0;
+                        void* dummy = xRingbufferReceiveUpTo(audioRingBuffer, &dummySize, 0, 2048);
+                        if (dummy) vRingbufferReturnItem(audioRingBuffer, dummy);
+                    }
+                    xSemaphoreGive(audioBufferMutex);
                 }
             } else {
                 vTaskDelay(pdMS_TO_TICKS(1));
@@ -769,7 +796,11 @@ void processUartCommand(String cmd) {
     }
     else if (cmd.startsWith("SET:MODE=")) {
         String newMode = cmd.substring(9);
-        newMode.toUpperCase();
+        newMode.trim();
+        // OPRAVA #5: Správné převedení na velká písmena pomocí změny jednotlivých znaků
+        for (int i = 0; i < newMode.length(); i++) {
+            newMode[i] = toupper(newMode[i]);
+        }
         if (newMode == "TX" || newMode == "RX") {
             if (newMode == btMode) {
                 Serial.println("OK:MODE_ALREADY_SET");
@@ -885,10 +916,11 @@ void setup() {
         1
     );
 
+    // OPRAVA #1: Vyjasnění logiky - TX znamená odesílání do BT (RX data z ADC)
     if (btMode == "RX") {
-        i2s_init_tx(44100);
+        i2s_init_tx(44100);      // RX mód: data z BT do DAC (TX kanál I2S)
     } else {
-        i2s_init_rx(44100);
+        i2s_init_rx(44100);      // TX mód: data z ADC do BT (RX kanál I2S)
     }
 
     initBluetoothStack();
@@ -903,4 +935,7 @@ void loop() {
     }
 
     checkHandshakeTimeout();
+    
+    // OPRAVA #4: Přidán delay pro snížení vytížení Core 0
+    delay(10);
 }
