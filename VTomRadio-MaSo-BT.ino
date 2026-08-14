@@ -102,6 +102,13 @@ String generateDefaultName();
 #define AMP_GAIN         3 // +18dB zesílení
 
 // ==========================================
+// KONFIGURACE RINGBUFFERU (OPRAVA #6c)
+// ==========================================
+#define RING_BUFFER_INITIAL_SIZE   (32 * 1024)   // Počáteční 32 kB
+#define RING_BUFFER_MAX_SIZE       (128 * 1024)  // Max 128 kB
+#define RING_BUFFER_CRITICAL_LEVEL (28 * 1024)   // 87.5% → cleanup
+
+// ==========================================
 // DIAGNOSTIKA A LOGOVÁNÍ VÝPADKŮ (OPRAVA #6)
 // ==========================================
 
@@ -174,14 +181,23 @@ int read_and_process_audio(int16_t *out_pcm16_buffer, size_t max_samples) {
     }
     return 0;
 #else
-    static int32_t raw_i2s_32bit_buffer[512]; 
+    static int32_t raw_i2s_32bit_buffer[256];           // bylo 512
     size_t bytes_read = 0;
     
     size_t samples_to_read = max_samples; 
-    if (samples_to_read > 512) samples_to_read = 512;
+    if (samples_to_read > 256) samples_to_read = 256;   // bylo 512
 
     if (i2s_channel_read(rx_chan, raw_i2s_32bit_buffer, samples_to_read * sizeof(int32_t), &bytes_read, pdMS_TO_TICKS(10)) == ESP_OK) {
         int samples_count = bytes_read / sizeof(int32_t);
+
+        // ⚠️ DEBUG: Logování I2S čtení
+        static unsigned long lastDebugReport = 0;
+        if (millis() - lastDebugReport > 5000) {  // Log každých 5 sekund
+            Serial.printf("DEBUG:I2S_READ=%lu_bytes,SAMPLES=%d,MAX_SAMPLES=%zu\n", 
+                          bytes_read, samples_count, max_samples);
+            lastDebugReport = millis();
+        }
+
         for (int i = 0; i < samples_count; i++) {
             int32_t val = raw_i2s_32bit_buffer[i] >> 14; 
             out_pcm16_buffer[i] = (int16_t)val; 
@@ -430,7 +446,6 @@ int32_t bt_a2dp_data_cb(uint8_t *data, int32_t len) {
         return len;
     }
 
-    // OPRAVA #6a: Zvýšit timeout z 5ms na 20ms (BT callback je kritický)
     if (audioBufferMutex != NULL && xSemaphoreTake(audioBufferMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
         size_t bytesRead = 0;
         void* item = xRingbufferReceiveUpTo(audioRingBuffer, &bytesRead, 0, len);
@@ -438,6 +453,9 @@ int32_t bt_a2dp_data_cb(uint8_t *data, int32_t len) {
         if (item != NULL && bytesRead > 0) {
             memcpy(data, item, bytesRead);
             vRingbufferReturnItem(audioRingBuffer, item);
+            
+            // Track trenutnu upotrebu
+            audioDiag.ringbufferCurrentUsage = bytesRead;
 
             if (bytesRead < (size_t)len) {
                 audioDiag.silenceFrameCount++;
@@ -450,15 +468,13 @@ int32_t bt_a2dp_data_cb(uint8_t *data, int32_t len) {
         }
         xSemaphoreGive(audioBufferMutex);
     } else {
-        // Mutex timeout - logovat
         audioDiag.mutexTimeoutCount++;
         audioDiag.lastMutexTimeoutTime = millis();
         memset(data, 0, len);
         
         static unsigned long lastMutexReport = 0;
-        if (millis() - lastMutexReport > 10000) { // Log každých 10 sec
-            Serial.printf("WARN:MUTEX_TIMEOUT,COUNT=%lu,TIME=%lu\n", 
-                          audioDiag.mutexTimeoutCount, millis());
+        if (millis() - lastMutexReport > 10000) {
+            Serial.printf("WARN:MUTEX_TIMEOUT,COUNT=%lu\n", audioDiag.mutexTimeoutCount);
             lastMutexReport = millis();
         }
     }
@@ -671,7 +687,7 @@ void audioProcessingTask(void *pvParameters) {
         return;
     }
 
-    audioRingBuffer = xRingbufferCreate(32 * 1024, RINGBUF_TYPE_BYTEBUF);
+    audioRingBuffer = xRingbufferCreate(RING_BUFFER_INITIAL_SIZE, RINGBUF_TYPE_BYTEBUF);
     if (audioRingBuffer == NULL) {
         Serial.println("ERR:RINGBUFFER_FAILED");
         vSemaphoreDelete(audioBufferMutex);
@@ -680,7 +696,8 @@ void audioProcessingTask(void *pvParameters) {
         return;
     }
 
-    static int16_t pcm16Buf[512]; 
+    static int16_t pcm16Buf[512];
+    static unsigned long lastCleanupTime = 0;
 
     for (;;) {
         if (btMode == "TX" && rx_chan != NULL) {
@@ -695,38 +712,49 @@ void audioProcessingTask(void *pvParameters) {
             if (total_samples > 0 && audioRingBuffer != NULL) {
                 size_t bytesToSend = total_samples * sizeof(int16_t);
                 
-                // OPRAVA #6b: Kratší kritická sekce - nesmí drží mutex déle než 5ms
+                // OPRAVA #6c: Inteligentní sending s backpressure
                 if (xSemaphoreTake(audioBufferMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                    BaseType_t sendResult = xRingbufferSend(audioRingBuffer, pcm16Buf, bytesToSend, pdMS_TO_TICKS(5));
+                    BaseType_t sendResult = xRingbufferSend(audioRingBuffer, pcm16Buf, bytesToSend, pdMS_TO_TICKS(2));
                     
-                    // Hned uvolnit mutex
                     xSemaphoreGive(audioBufferMutex);
                     
-                    // Teprve pak řešit přetečení (mimo kritickou sekci)
                     if (sendResult != pdTRUE) {
                         audioDiag.ringbufferOverflowCount++;
                         audioDiag.lastOverflowTime = millis();
                         audioDiag.audioDataDroppedBytes += bytesToSend;
                         
-                        static unsigned long lastOverflowReport = 0;
-                        if (millis() - lastOverflowReport > 10000) {
-                            Serial.printf("WARN:RINGBUFFER_OVERFLOW,COUNT=%lu,DROPPED=%lu\n", 
-                                          audioDiag.ringbufferOverflowCount, 
-                                          audioDiag.audioDataDroppedBytes);
-                            lastOverflowReport = millis();
+                        // Agresivnější cleanup - smazat starší data
+                        if (xSemaphoreTake(audioBufferMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                            size_t freedBytes = 0;
+                            
+                            // Smazat až 8 kB starých dat
+                            for (int attempt = 0; attempt < 8; attempt++) {
+                                size_t dummySize = 0;
+                                void* dummy = xRingbufferReceiveUpTo(audioRingBuffer, &dummySize, 0, 1024);
+                                if (dummy) {
+                                    vRingbufferReturnItem(audioRingBuffer, dummy);
+                                    freedBytes += dummySize;
+                                } else {
+                                    break;
+                                }
+                            }
+                            xSemaphoreGive(audioBufferMutex);
+                            
+                            static unsigned long lastOverflowReport = 0;
+                            if (millis() - lastOverflowReport > 10000) {
+                                Serial.printf("WARN:RINGBUFFER_OVERFLOW,COUNT=%lu,DROPPED=%lu,FREED=%lu\n", 
+                                              audioDiag.ringbufferOverflowCount, 
+                                              audioDiag.audioDataDroppedBytes,
+                                              freedBytes);
+                                lastOverflowReport = millis();
+                            }
                         }
                         
-                        // Cleanup mimo kritickou sekci
-                        vTaskDelay(pdMS_TO_TICKS(2));
-                        if (xSemaphoreTake(audioBufferMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                            size_t dummySize = 0;
-                            void* dummy = xRingbufferReceiveUpTo(audioRingBuffer, &dummySize, 0, 2048);
-                            if (dummy) vRingbufferReturnItem(audioRingBuffer, dummy);
-                            xSemaphoreGive(audioBufferMutex);
-                        }
+                        // Backpressure: počkat aby se buffer vyprázdnil
+                        vTaskDelay(pdMS_TO_TICKS(5));
                     }
                 } else {
-                    vTaskDelay(pdMS_TO_TICKS(1));
+                    vTaskDelay(pdMS_TO_TICKS(2));
                 }
             } else {
                 vTaskDelay(pdMS_TO_TICKS(1));
