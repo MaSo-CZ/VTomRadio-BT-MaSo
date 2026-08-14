@@ -4,6 +4,8 @@
   #error "This code is intended exclusively for classic ESP32 (CONFIG_IDF_TARGET_ESP32)! Please check your target board selection in Arduino IDE."
 #endif
 
+#define FW_VERSION "VTomRadio-MaSo-BT v0.3"
+
 #include <Preferences.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -23,10 +25,10 @@
 #include "driver/i2s_std.h"
 
 // Definice pinů
-#define I2S_BCLK_PIN    GPIO_NUM_12   // Společný Bit Clock
-#define I2S_WS_PIN      GPIO_NUM_27   // Společný Word Select (LRCLK)
-#define I2S_DOUT_PIN    GPIO_NUM_14   // Data Out (Vysílání do DAC / BT RX mód)
-#define I2S_DIN_PIN     GPIO_NUM_26   // Data In (Příjem z ADC / BT TX mód)
+#define I2S_BCLK_PIN    GPIO_NUM_27   // Společný Bit Clock
+#define I2S_WS_PIN      GPIO_NUM_25   // Společný Word Select (LRCLK)
+#define I2S_DOUT_PIN    GPIO_NUM_26   // Data Out (Vysílání do DAC / BT RX mód)
+#define I2S_DIN_PIN     GPIO_NUM_33   // Data In (Příjem z ADC / BT TX mód)
 
 // Globální i2s handle
 static i2s_chan_handle_t tx_chan = NULL;
@@ -93,7 +95,7 @@ void initBluetoothStack();
 void audioProcessingTask(void *pvParameters);
 String generateDefaultName();
 
-#define USE_INMP441_MIC  1 // Set 0 pro vypnutí mikrofonu (např. při příjmu z jiného ESP)
+#define USE_INMP441_MIC  0 // Set 0 pro vypnutí mikrofonu (např. při příjmu z jiného ESP)
 #define AMP_GAIN         3 // +18dB zesílení
 
 // Funkce pro načtení z I2S a úpravu pro BT / další zpracování
@@ -127,6 +129,28 @@ int read_and_process_audio(int16_t *out_pcm16_buffer, size_t max_samples) {
             out_pcm16_buffer[out_idx++] = sample_16; 
         }
         return out_idx;
+    }
+    return 0;
+#else
+    // PŘÍJEM Z MASTER ESP32 (32-bit STEREO Philips stream z Rádia)
+    static int32_t raw_i2s_32bit_buffer[512]; 
+    size_t bytes_read = 0;
+    
+    size_t samples_to_read = max_samples; 
+    if (samples_to_read > 512) samples_to_read = 512;
+
+    if (i2s_channel_read(rx_chan, raw_i2s_32bit_buffer, samples_to_read * sizeof(int32_t), &bytes_read, pdMS_TO_TICKS(10)) == ESP_OK) {
+        int samples_count = bytes_read / sizeof(int32_t);
+
+        for (int i = 0; i < samples_count; i++) {
+            // Správný posun z 32-bit slotu na 16-bit sample (Philips I2S má MSB nahoře)
+            int32_t val = raw_i2s_32bit_buffer[i] >> 14; 
+            
+            // Pokud by to bylo velmi tiché, zkuste posun upravit např. na >> 8 nebo >> 12 podle toho, 
+            // jak rádio zarovnává 16bit vzorek do 32bit DMA bufferu
+            out_pcm16_buffer[i] = (int16_t)val; 
+        }
+        return samples_count; 
     }
     return 0;
 #endif
@@ -202,15 +226,21 @@ bool i2s_init_tx(uint32_t sample_rate) {
 bool i2s_init_rx(uint32_t sample_rate) {
     i2s_stop_and_deinit();
 
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+//    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_SLAVE);
     chan_cfg.dma_desc_num = 6;
     chan_cfg.dma_frame_num = 256;
 
     if (i2s_new_channel(&chan_cfg, NULL, &rx_chan) != ESP_OK) return false;
 
+#if USE_INMP441_MIC
     // KONFIGURACE PRO INMP441 S PINEM L/R NA VDD
     i2s_std_slot_config_t slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO);
     slot_cfg.slot_mask = I2S_STD_SLOT_RIGHT; // L/R pin na VDD = RIGHT slot
+#else
+    i2s_std_slot_config_t slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO);
+//    slot_cfg.slot_mask = I2S_STD_SLOT_RIGHT; // L/R pin na VDD = RIGHT slot
+#endif
 
     i2s_std_config_t std_cfg = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate),
@@ -228,7 +258,11 @@ bool i2s_init_rx(uint32_t sample_rate) {
     if (i2s_channel_init_std_mode(rx_chan, &std_cfg) != ESP_OK) return false;
     if (i2s_channel_enable(rx_chan) != ESP_OK) return false;
 
+#if USE_INMP441_MIC
     Serial.println("I2S: RX Inicializován (INMP441 32-bit MONO RIGHT)");
+#else
+    Serial.println("I2S: RX Inicializovan (Slave RX)");
+#endif
     return true;
 }
 
@@ -462,6 +496,22 @@ void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param) {
     }
 }
 
+void bt_gap_search_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param) {
+    if (event == ESP_BT_GAP_DISC_RES_EVT) {
+        // Nalezeno zařízení v okolí
+        Serial.printf("INFO: Nalezeno BT zarizeni: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                      param->disc_res.bda[0], param->disc_res.bda[1], param->disc_res.bda[2],
+                      param->disc_res.bda[3], param->disc_res.bda[4], param->disc_res.bda[5]);
+
+        // Pokud nejsme připojeni, zkusíme se připojit k tomuto zařízení
+        if (!isConnected && btMode == "TX") {
+            Serial.println("INFO: Pokus o pripojeni...");
+            esp_bt_gap_cancel_discovery(); // Zastavíme skenování
+            esp_a2d_source_connect(param->disc_res.bda);
+        }
+    }
+}
+
 void initBluetoothStack() {
     esp_err_t ret;
 
@@ -539,6 +589,12 @@ void initBluetoothStack() {
         Serial.printf("ERR: set_scan_mode failed: %s\n", esp_err_to_name(ret));
     } else {
         Serial.println("INFO: BT Scan mode set to CONNECTABLE & DISCOVERABLE");
+    }
+    if (btMode == "TX") {
+        esp_bt_gap_register_callback(bt_gap_search_cb);
+        Serial.println("INFO: Spoustim vyhledavani BT sluchatek (Inquiry)...");
+        // Skenujeme 10 sekund (10 * 1.28s)
+        esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 10, 0); 
     }
 }
 
@@ -739,7 +795,10 @@ void processUartCommand(String cmd) {
         }
     }
     else if (cmd == "GET:INFO") {
-        Serial.printf("INFO:FW_v1.0,RAM_FREE:%u,MODE:%s\n", ESP.getFreeHeap(), btMode.c_str());
+        Serial.printf("INFO:RAM_FREE:%u,MODE:%s\n", ESP.getFreeHeap(), btMode.c_str());
+    }
+    else if (cmd == "GET:FW") {
+        Serial.printf("INFO:%s\n", FW_VERSION);
     }
     else if (cmd == "GET:RSSI") {
         if (isConnected) {
